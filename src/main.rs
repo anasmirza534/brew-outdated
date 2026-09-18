@@ -10,7 +10,8 @@ use std::{process::Command, thread::sleep, time::Duration};
 //          --cask
 //          --no-update
 
-const RUN_UPDATE: bool = true;
+const RUN_UPDATE: bool = false;
+const IS_CASK: bool = true;
 
 fn main() {
     if RUN_UPDATE {
@@ -31,15 +32,22 @@ fn main() {
         }
     }
 
+    let mut args = vec!["leaves"];
+    if IS_CASK {
+        args = vec!["list", "--cask"];
+    }
+
+    let cmd_name = format!("brew {}", args.join(" "));
+
     let output = Command::new("brew")
-        .arg("leaves")
+        .args(args.clone())
         .output()
-        .expect("`brew leaves` failed");
+        .expect(format!("`{}` failed", cmd_name).as_str());
 
     if !output.status.success() {
         eprintln!(
-            "`brew leaves` returns non zero exit code: {}",
-            output.status
+            "`{}` returns non zero exit code: {}",
+            cmd_name, output.status
         );
 
         return;
@@ -53,12 +61,13 @@ fn main() {
         .filter(|l| !l.is_empty())
         .collect();
 
+    // sort in place
     formulae_names.sort();
 
     // run concurrently based on cpu cores available
     let formulaes: Vec<Formulae> = formulae_names
         .par_iter()
-        .map(|f| get_formulae_versions(f.to_string()))
+        .map(|f| get_formulae_versions(f.to_string(), IS_CASK))
         .collect();
 
     let mut need_update: Vec<Formulae> = vec![];
@@ -66,59 +75,61 @@ fn main() {
     let mut unknowns: Vec<Formulae> = vec![];
 
     for formulae in formulaes.into_iter() {
-        let current = formulae.current.clone().unwrap_or("null".to_string());
-        let latest = formulae.latest.clone().unwrap_or("null".to_string());
-
-        if current == "null" {
-            unknowns.push(formulae);
-        } else if current == latest {
-            up_to_date.push(formulae);
-        } else {
-            need_update.push(formulae);
+        match (&formulae.current, &formulae.latest) {
+            (None, _) => unknowns.push(formulae),
+            (Some(c), Some(l)) if c == l => up_to_date.push(formulae),
+            _ => need_update.push(formulae),
         }
     }
 
-    println!("============================");
-    println!("Need to update: ");
-    println!("============================");
-    for f in need_update {
-        println!(
-            "{} {} -> {}",
-            f.name,
-            f.current.unwrap_or("".to_string()),
-            f.latest.unwrap_or("".to_string())
-        );
-    }
+    print_table("Need to update: ", need_update);
 
-    println!("");
-    println!("============================");
-    println!("Up to update: ");
-    println!("============================");
-    for f in up_to_date {
-        println!("{} {}", f.name, f.current.unwrap_or("".to_string()),);
-    }
+    print_table("Up to update: ", up_to_date);
 
-    println!("");
-    println!("============================");
-    println!("Unknowns: ");
-    println!("============================");
-    for f in unknowns {
-        println!("{} {}", f.name, f.current.unwrap_or("".to_string()),);
-    }
+    print_table("Unknowns: ", unknowns);
 }
 
-#[derive(Debug)]
+fn max_width(formulaes: &[Formulae], get: impl Fn(&Formulae) -> &str) -> usize {
+    formulaes.iter().map(|f| get(f).len()).max().unwrap_or(0)
+}
+
+fn print_table(title: &str, formulaes: Vec<Formulae>) {
+    if formulaes.is_empty() {
+        return;
+    }
+
+    let name_width = max_width(&formulaes, |f| f.name.as_str()) + 2;
+    let current_width = max_width(&formulaes, |f| f.current.as_deref().unwrap_or("-")) + 2;
+    let latest_width = max_width(&formulaes, |f| f.latest.as_deref().unwrap_or("-")) + 2;
+
+    println!("{}", title);
+    println!("");
+    for f in &formulaes {
+        println!(
+            "{:<name_width$} {:<current_width$} ->   {:<latest_width$}",
+            f.name.clone(),
+            f.current.clone().unwrap_or("-".into()),
+            f.latest.clone().unwrap_or("-".into()),
+        );
+    }
+    println!("");
+}
+
 struct Formulae {
     name: String,
     current: Option<String>,
     latest: Option<String>,
 }
 
-fn get_formulae_versions(formulae: String) -> Formulae {
+fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
+    let mut args = vec!["info", "--json=v2"];
+    if is_cask {
+        args.push("--cask")
+    }
+    args.push(&formulae);
+
     let output = Command::new("brew")
-        .arg("info")
-        .arg("--json=v2")
-        .arg(formulae.clone())
+        .args(args)
         .output()
         .expect("failed to execute command");
 
@@ -141,13 +152,23 @@ fn get_formulae_versions(formulae: String) -> Formulae {
 
     match serde_json::from_str::<Value>(&stdout) {
         Ok(json) => {
-            let current = json["formulae"][0]["installed"][0]["version"]
-                .as_str()
-                .map(|s| s.to_string());
+            let current = if is_cask {
+                json["casks"][0]["installed"]
+                    .as_str()
+                    .map(|s| s.to_string())
+            } else {
+                json["formulae"][0]["installed"][0]["version"]
+                    .as_str()
+                    .map(|s| s.to_string())
+            };
 
-            let latest = json["formulae"][0]["versions"]["stable"]
-                .as_str()
-                .map(|s| s.to_string());
+            let latest = if is_cask {
+                json["casks"][0]["version"].as_str().map(|s| s.to_string())
+            } else {
+                json["formulae"][0]["versions"]["stable"]
+                    .as_str()
+                    .map(|s| s.to_string())
+            };
 
             Formulae {
                 name: formulae,
