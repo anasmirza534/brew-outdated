@@ -2,55 +2,84 @@ use rand;
 use rand::Rng;
 use rayon::prelude::*;
 use serde_json::Value;
-use std::{process::Command, thread::sleep, time::Duration};
+use std::{
+    env,
+    io::Write,
+    process::{Command, ExitCode},
+    thread, time,
+};
 
-// command structure:
-// brew-outdate
-//      flags:
-//          --cask
-//          --no-update
+fn main() -> ExitCode {
+    let mut help_flag = false;
+    let mut no_update_flag = false;
+    let mut cask_flag = false;
 
-const RUN_UPDATE: bool = false;
-const IS_CASK: bool = true;
+    let mut args: Vec<String> = env::args().collect();
 
-fn main() {
-    if RUN_UPDATE {
+    args.remove(0);
+    for arg in args.iter() {
+        if arg == "--help" {
+            help_flag = true;
+        } else if arg == "--no-update" {
+            no_update_flag = true;
+        } else if arg == "--cask" {
+            cask_flag = true;
+        } else {
+            eprintln!("unknown flag: {}", arg);
+            eprintln!("");
+            print_help_stderr();
+
+            return ExitCode::FAILURE;
+        }
+    }
+
+    if help_flag {
+        print_help_stdout();
+
+        return ExitCode::SUCCESS;
+    }
+
+    if no_update_flag {
         println!("running `brew update`");
 
-        let output = Command::new("brew")
-            .arg("update")
-            .output()
-            .expect("`brew update` failed");
+        let output = match Command::new("brew").arg("update").output() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("`brew update` failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+        };
 
         if !output.status.success() {
             eprintln!(
                 "`brew update` returns non zero exit code: {}",
                 output.status
             );
-
-            return;
+            return ExitCode::FAILURE;
         }
     }
 
     let mut args = vec!["leaves"];
-    if IS_CASK {
+    if cask_flag {
         args = vec!["list", "--cask"];
     }
 
     let cmd_name = format!("brew {}", args.join(" "));
 
-    let output = Command::new("brew")
-        .args(args.clone())
-        .output()
-        .expect(format!("`{}` failed", cmd_name).as_str());
+    let output = match Command::new("brew").args(args.clone()).output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("`{}` failed: {}", cmd_name, e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     if !output.status.success() {
         eprintln!(
             "`{}` returns non zero exit code: {}",
             cmd_name, output.status
         );
-
-        return;
+        return ExitCode::FAILURE;
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -67,7 +96,7 @@ fn main() {
     // run concurrently based on cpu cores available
     let formulaes: Vec<Formulae> = formulae_names
         .par_iter()
-        .map(|f| get_formulae_versions(f.to_string(), IS_CASK))
+        .map(|f| get_formulae_versions(f.to_string(), cask_flag))
         .collect();
 
     let mut need_update: Vec<Formulae> = vec![];
@@ -87,10 +116,28 @@ fn main() {
     print_table("Up to update: ", up_to_date);
 
     print_table("Unknowns: ", unknowns);
+
+    return ExitCode::SUCCESS;
 }
 
 fn max_width(formulaes: &[Formulae], get: impl Fn(&Formulae) -> &str) -> usize {
     formulaes.iter().map(|f| get(f).len()).max().unwrap_or(0)
+}
+
+fn print_help_stdout() {
+    print_help(std::io::stdout());
+}
+
+fn print_help_stderr() {
+    print_help(std::io::stderr());
+}
+
+fn print_help(mut out: impl Write) {
+    let _ = writeln!(out, "usage: brew-outdate [flags]");
+    let _ = writeln!(out, "   flags:");
+    let _ = writeln!(out, "      --cask");
+    let _ = writeln!(out, "      --no-update");
+    let _ = writeln!(out, "      --help");
 }
 
 fn print_table(title: &str, formulaes: Vec<Formulae>) {
@@ -128,10 +175,21 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
     }
     args.push(&formulae);
 
-    let output = Command::new("brew")
-        .args(args)
-        .output()
-        .expect("failed to execute command");
+    let output = match Command::new("brew").args(args).output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "failed to get info for formulae: {}, error: {}",
+                formulae, e
+            );
+
+            return Formulae {
+                name: formulae,
+                current: None,
+                latest: None,
+            };
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -194,7 +252,7 @@ fn get_formulae_mock(formulae: String) -> Formulae {
 
     let n: u32 = rand::thread_rng().gen_range(200..1500);
 
-    sleep(Duration::from_millis(n.into()));
+    thread::sleep(time::Duration::from_millis(n.into()));
 
     let prob = rand::random::<f64>();
     if prob <= 0.1 {
