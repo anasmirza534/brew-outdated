@@ -1,4 +1,3 @@
-use rand;
 use rand::Rng;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -17,9 +16,8 @@ fn main() -> ExitCode {
     let mut no_update_flag = false;
     let mut cask_flag = false;
 
-    let mut args: Vec<String> = env::args().collect();
+    let args: Vec<String> = env::args().skip(1).collect();
 
-    args.remove(0);
     for arg in args.iter() {
         if arg == "--help" {
             help_flag = true;
@@ -62,14 +60,14 @@ fn main() -> ExitCode {
         }
     }
 
-    let mut args = vec!["leaves"];
+    let mut brew_args = vec!["leaves"];
     if cask_flag {
-        args = vec!["list", "--cask"];
+        brew_args = vec!["list", "--cask"];
     }
 
-    let cmd_name = format!("brew {}", args.join(" "));
+    let cmd_name = format!("brew {}", brew_args.join(" "));
 
-    let output = match Command::new("brew").args(args.clone()).output() {
+    let output = match Command::new("brew").args(brew_args.clone()).output() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("`{}` failed: {}", cmd_name, e);
@@ -107,7 +105,7 @@ fn main() -> ExitCode {
     let mut unknowns: Vec<Formulae> = vec![];
 
     for formulae in formulaes.into_iter() {
-        match (&formulae.current, &formulae.latest) {
+        match (&formulae.installed, &formulae.latest) {
             (None, _) => unknowns.push(formulae),
             (Some(c), Some(l)) if c == l => up_to_date.push(formulae),
             _ => need_update.push(formulae),
@@ -215,17 +213,17 @@ fn print_table(title: &str, formulaes: Vec<Formulae>) {
     }
 
     let name_width = max_width(&formulaes, |f| f.name.as_str()) + 2;
-    let current_width = max_width(&formulaes, |f| f.current.as_deref().unwrap_or("-")) + 2;
+    let installed_width = max_width(&formulaes, |f| f.installed.as_deref().unwrap_or("-")) + 2;
     let latest_width = max_width(&formulaes, |f| f.latest.as_deref().unwrap_or("-")) + 2;
 
     println!("{}", title);
     println!("");
     for f in &formulaes {
         println!(
-            "{:<name_width$} {:<current_width$} ->   {:<latest_width$}",
+            "{:<name_width$} {:<installed_width$} ->   {:<latest_width$}",
             f.name.clone(),
-            f.current.clone().unwrap_or("-".into()),
-            f.latest.clone().unwrap_or("-".into()),
+            f.installed.as_deref().unwrap_or("-".into()),
+            f.latest.as_deref().unwrap_or("-".into()),
         );
     }
     println!("");
@@ -233,8 +231,16 @@ fn print_table(title: &str, formulaes: Vec<Formulae>) {
 
 struct Formulae {
     name: String,
-    current: Option<String>,
+    installed: Option<String>,
     latest: Option<String>,
+}
+
+fn unknown_formulae(name: String) -> Formulae {
+    Formulae {
+        name,
+        installed: None,
+        latest: None,
+    }
 }
 
 fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
@@ -252,11 +258,7 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
                 formulae, e
             );
 
-            return Formulae {
-                name: formulae,
-                current: None,
-                latest: None,
-            };
+            return unknown_formulae(formulae);
         }
     };
 
@@ -268,18 +270,14 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
             output.status, stderr
         );
 
-        return Formulae {
-            name: formulae,
-            current: None,
-            latest: None,
-        };
+        return unknown_formulae(formulae);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     match serde_json::from_str::<Value>(&stdout) {
         Ok(json) => {
-            let current = if is_cask {
+            let installed = if is_cask {
                 json["casks"][0]["installed"]
                     .as_str()
                     .map(|s| s.to_string())
@@ -299,18 +297,14 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
 
             Formulae {
                 name: formulae,
-                current: current,
-                latest: latest,
+                installed,
+                latest,
             }
         }
         Err(e) => {
             eprintln!("failed to parse json: {}", e);
 
-            Formulae {
-                name: formulae,
-                current: None,
-                latest: None,
-            }
+            unknown_formulae(formulae)
         }
     }
 }
@@ -327,7 +321,7 @@ fn get_formulae_mock(formulae: String) -> Formulae {
     if prob <= 0.1 {
         return Formulae {
             name: formulae,
-            current: None,
+            installed: None,
             latest: None,
         };
     }
@@ -335,14 +329,14 @@ fn get_formulae_mock(formulae: String) -> Formulae {
     if prob >= 0.1 && prob <= 0.75 {
         return Formulae {
             name: formulae,
-            current: Some("1.0.3".to_string()),
+            installed: Some("1.0.3".to_string()),
             latest: Some("1.0.3".to_string()),
         };
     }
 
     Formulae {
         name: formulae,
-        current: Some("2.5.3".to_string()),
+        installed: Some("2.5.3".to_string()),
         latest: Some("2.8.11".to_string()),
     }
 }
@@ -356,4 +350,6 @@ fn test_process_via_workers() {
     println!("testing");
 
     assert!(vals.len() == result.len());
+
+    assert!(result.iter().map(|f| &f.name).eq(vals.iter()));
 }
