@@ -1,12 +1,15 @@
 use rand;
 use rand::Rng;
-use rayon::prelude::*;
 use serde_json::Value;
+use std::collections::VecDeque;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::{
     env,
     io::Write,
     process::{Command, ExitCode},
-    thread, time,
+    thread,
 };
 
 fn main() -> ExitCode {
@@ -93,11 +96,11 @@ fn main() -> ExitCode {
     // sort in place
     formulae_names.sort();
 
-    // run concurrently based on cpu cores available
-    let formulaes: Vec<Formulae> = formulae_names
-        .par_iter()
-        .map(|f| get_formulae_versions(f.to_string(), cask_flag))
-        .collect();
+    let formulaes = process_via_workers(
+        formulae_names,
+        move |f| get_formulae_versions(f.to_string(), cask_flag),
+        None,
+    );
 
     let mut need_update: Vec<Formulae> = vec![];
     let mut up_to_date: Vec<Formulae> = vec![];
@@ -118,6 +121,72 @@ fn main() -> ExitCode {
     print_table("Unknowns: ", unknowns);
 
     return ExitCode::SUCCESS;
+}
+
+fn process_via_workers(
+    data: Vec<String>,
+    get: impl Fn(&String) -> Formulae + Send + Sync + 'static,
+    worker_num: Option<usize>,
+) -> Vec<Formulae> {
+    let debug = false;
+
+    let worker_count = worker_num.unwrap_or_else(|| {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+    });
+
+    let get = Arc::new(get);
+
+    let mut handlers = vec![];
+    let (tx, rx) = mpsc::channel();
+
+    let indexed: VecDeque<(usize, String)> = data.into_iter().enumerate().collect();
+    let queue = Arc::new(Mutex::new(indexed));
+
+    for wc in 1..=worker_count {
+        let worker_name = format!("{:0>2}", wc.to_string());
+        if debug {
+            println!("creating worker: {}", worker_name);
+        }
+
+        let get = Arc::clone(&get);
+        let tx1 = tx.clone();
+        let queue1 = Arc::clone(&queue);
+
+        handlers.push(thread::spawn(move || {
+            // single worker
+            loop {
+                let val = queue1
+                    .lock()
+                    .unwrap_or_else(|queue| queue.into_inner())
+                    .pop_front();
+
+                match val {
+                    Some((idx, val)) => {
+                        if debug {
+                            println!("processing worker name: {} -> val {}", worker_name, val);
+                        }
+
+                        let formulae = get(&val);
+                        tx1.send((idx, formulae)).unwrap();
+                    }
+                    None => break,
+                }
+            }
+        }));
+    }
+
+    for handler in handlers.into_iter() {
+        handler.join().unwrap();
+    }
+
+    drop(tx);
+
+    let mut result: Vec<(usize, Formulae)> = rx.into_iter().collect();
+    result.sort_by_key(|(idx, _)| *idx);
+
+    result.into_iter().map(|(_, f)| f).collect()
 }
 
 fn max_width(formulaes: &[Formulae], get: impl Fn(&Formulae) -> &str) -> usize {
@@ -248,11 +317,11 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
 
 #[allow(dead_code)]
 fn get_formulae_mock(formulae: String) -> Formulae {
-    println!("Processing: {}", formulae);
+    let wait_mili: u32 = rand::thread_rng().gen_range(200..1500);
 
-    let n: u32 = rand::thread_rng().gen_range(200..1500);
+    println!("Processing: {}\t\twait: {:<5} mili", formulae, wait_mili);
 
-    thread::sleep(time::Duration::from_millis(n.into()));
+    thread::sleep(Duration::from_millis(wait_mili.into()));
 
     let prob = rand::random::<f64>();
     if prob <= 0.1 {
@@ -276,4 +345,15 @@ fn get_formulae_mock(formulae: String) -> Formulae {
         current: Some("2.5.3".to_string()),
         latest: Some("2.8.11".to_string()),
     }
+}
+
+#[test]
+fn test_process_via_workers() {
+    let vals: Vec<String> = (1..=18).map(|n| n.to_string()).collect();
+
+    let result = process_via_workers(vals.clone(), |f| get_formulae_mock(f.to_string()), None);
+
+    println!("testing");
+
+    assert!(vals.len() == result.len());
 }
