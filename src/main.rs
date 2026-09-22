@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if no_update_flag {
+    if !no_update_flag {
         println!("running `brew update`");
 
         let output = match Command::new("brew").arg("update").output() {
@@ -187,10 +187,6 @@ fn process_via_workers(
     result.into_iter().map(|(_, f)| f).collect()
 }
 
-fn max_width(formulaes: &[Formulae], get: impl Fn(&Formulae) -> &str) -> usize {
-    formulaes.iter().map(|f| get(f).len()).max().unwrap_or(0)
-}
-
 fn print_help_stdout() {
     print_help(std::io::stdout());
 }
@@ -205,6 +201,10 @@ fn print_help(mut out: impl Write) {
     let _ = writeln!(out, "      --cask");
     let _ = writeln!(out, "      --no-update");
     let _ = writeln!(out, "      --help");
+}
+
+fn max_width(formulaes: &[Formulae], get: impl Fn(&Formulae) -> &str) -> usize {
+    formulaes.iter().map(|f| get(f).len()).max().unwrap_or(0)
 }
 
 fn print_table(title: &str, formulaes: Vec<Formulae>) {
@@ -235,22 +235,32 @@ struct Formulae {
     latest: Option<String>,
 }
 
-fn unknown_formulae(name: String) -> Formulae {
-    Formulae {
-        name,
-        installed: None,
-        latest: None,
+impl Formulae {
+    fn new(name: String, installed: Option<String>, latest: Option<String>) -> Formulae {
+        Formulae {
+            name,
+            installed,
+            latest,
+        }
+    }
+
+    fn unknown(name: String) -> Formulae {
+        Formulae {
+            name,
+            installed: None,
+            latest: None,
+        }
     }
 }
 
 fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
-    let mut args = vec!["info", "--json=v2"];
+    let mut brew_args = vec!["info", "--json=v2"];
     if is_cask {
-        args.push("--cask")
+        brew_args.push("--cask")
     }
-    args.push(&formulae);
+    brew_args.push(&formulae);
 
-    let output = match Command::new("brew").args(args).output() {
+    let output = match Command::new("brew").args(brew_args).output() {
         Ok(o) => o,
         Err(e) => {
             eprintln!(
@@ -258,7 +268,7 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
                 formulae, e
             );
 
-            return unknown_formulae(formulae);
+            return Formulae::unknown(formulae);
         }
     };
 
@@ -270,7 +280,7 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
             output.status, stderr
         );
 
-        return unknown_formulae(formulae);
+        return Formulae::unknown(formulae);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -295,16 +305,12 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
                     .map(|s| s.to_string())
             };
 
-            Formulae {
-                name: formulae,
-                installed,
-                latest,
-            }
+            Formulae::new(formulae, installed, latest)
         }
         Err(e) => {
             eprintln!("failed to parse json: {}", e);
 
-            unknown_formulae(formulae)
+            Formulae::unknown(formulae)
         }
     }
 }
@@ -346,8 +352,6 @@ fn test_process_via_workers() {
     let vals: Vec<String> = (1..=18).map(|n| n.to_string()).collect();
 
     let result = process_via_workers(vals.clone(), |f| get_formulae_mock(f.to_string()), None);
-
-    println!("testing");
 
     assert!(vals.len() == result.len());
 
