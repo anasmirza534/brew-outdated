@@ -27,7 +27,7 @@ fn main() -> ExitCode {
             cask_flag = true;
         } else {
             eprintln!("unknown flag: {}", arg);
-            eprintln!("");
+            eprintln!();
             print_help_stderr();
 
             return ExitCode::FAILURE;
@@ -118,7 +118,7 @@ fn main() -> ExitCode {
 
     print_table("Unknowns: ", unknowns);
 
-    return ExitCode::SUCCESS;
+    ExitCode::SUCCESS
 }
 
 fn process_via_workers(
@@ -217,16 +217,16 @@ fn print_table(title: &str, formulaes: Vec<Formulae>) {
     let latest_width = max_width(&formulaes, |f| f.latest.as_deref().unwrap_or("-")) + 2;
 
     println!("{}", title);
-    println!("");
+    println!();
     for f in &formulaes {
         println!(
             "{:<name_width$} {:<installed_width$} ->   {:<latest_width$}",
             f.name.clone(),
-            f.installed.as_deref().unwrap_or("-".into()),
-            f.latest.as_deref().unwrap_or("-".into()),
+            f.installed.as_deref().unwrap_or("-"),
+            f.latest.as_deref().unwrap_or("-"),
         );
     }
-    println!("");
+    println!();
 }
 
 struct Formulae {
@@ -321,7 +321,7 @@ fn get_formulae_mock(formulae: String) -> Formulae {
 
     println!("Processing: {}\t\twait: {:<5} mili", formulae, wait_mili);
 
-    thread::sleep(Duration::from_millis(wait_mili.into()));
+    thread::sleep(Duration::from_millis(wait_mili as u64));
 
     let prob = rand::random::<f64>();
     if prob <= 0.1 {
@@ -332,7 +332,7 @@ fn get_formulae_mock(formulae: String) -> Formulae {
         };
     }
 
-    if prob >= 0.1 && prob <= 0.75 {
+    if (0.1..=0.75).contains(&prob) {
         return Formulae {
             name: formulae,
             installed: Some("1.0.3".to_string()),
