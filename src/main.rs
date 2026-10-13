@@ -112,11 +112,11 @@ fn main() -> ExitCode {
         }
     }
 
-    print_table("Need to update: ", need_update);
+    print_table("Need to update: ", need_update, false);
 
-    print_table("Up to update: ", up_to_date);
+    print_table("Up to update: ", up_to_date, true);
 
-    print_table("Unknowns: ", unknowns);
+    print_table("Unknowns: ", unknowns, true);
 
     ExitCode::SUCCESS
 }
@@ -196,6 +196,8 @@ fn print_help_stderr() {
 }
 
 fn print_help(mut out: impl Write) {
+    let _ = writeln!(out, "brew-outdate: list oudated package from brew");
+    let _ = writeln!(out, "version: 0.1.1");
     let _ = writeln!(out, "usage: brew-outdate [flags]");
     let _ = writeln!(out, "   flags:");
     let _ = writeln!(out, "      --cask");
@@ -207,24 +209,44 @@ fn max_width(formulaes: &[Formulae], get: impl Fn(&Formulae) -> &str) -> usize {
     formulaes.iter().map(|f| get(f).len()).max().unwrap_or(0)
 }
 
-fn print_table(title: &str, formulaes: Vec<Formulae>) {
+fn print_table(title: &str, formulaes: Vec<Formulae>, only_installed: bool) {
     if formulaes.is_empty() {
         return;
     }
 
-    let name_width = max_width(&formulaes, |f| f.name.as_str()) + 2;
-    let installed_width = max_width(&formulaes, |f| f.installed.as_deref().unwrap_or("-")) + 2;
-    let latest_width = max_width(&formulaes, |f| f.latest.as_deref().unwrap_or("-")) + 2;
+    let name_width = max_width(&formulaes, |f| f.name.as_str()).max("Name".len()) + 2;
+    let installed_width =
+        max_width(&formulaes, |f| f.installed.as_deref().unwrap_or("-")).max("Installed".len()) + 2;
+    let latest_width =
+        max_width(&formulaes, |f| f.latest.as_deref().unwrap_or("-")).max("Latest".len()) + 2;
 
     println!("{}", title);
     println!();
-    for f in &formulaes {
+    if only_installed {
+        println!("{:<name_width$} {:<installed_width$}", "Name", "Installed",);
+    } else {
         println!(
-            "{:<name_width$} {:<installed_width$} ->   {:<latest_width$}",
-            f.name.clone(),
-            f.installed.as_deref().unwrap_or("-"),
-            f.latest.as_deref().unwrap_or("-"),
+            "{:<name_width$} {:<installed_width$}   {:<latest_width$}   Version Diff",
+            "Name", "Installed", "Latest"
         );
+    }
+
+    for f in &formulaes {
+        if only_installed {
+            println!(
+                "{:<name_width$} {:<installed_width$}",
+                f.name.clone(),
+                f.installed.as_deref().unwrap_or("-"),
+            );
+        } else {
+            println!(
+                "{:<name_width$} {:<installed_width$}   {:<latest_width$}   {}",
+                f.name.clone(),
+                f.installed.as_deref().unwrap_or("-"),
+                f.latest.as_deref().unwrap_or("-"),
+                f.version_diff()
+            );
+        }
     }
     println!();
 }
@@ -233,6 +255,34 @@ struct Formulae {
     name: String,
     installed: Option<String>,
     latest: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionDiff {
+    Missing,
+    Unparsable,
+    NoChange,
+    Major,
+    Minor,
+    Patch,
+    Build,
+    Downgrade,
+}
+
+impl std::fmt::Display for VersionDiff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Missing => "missing",
+            Self::Unparsable => "unparsable",
+            Self::NoChange => "no change",
+            Self::Major => "major",
+            Self::Minor => "minor",
+            Self::Patch => "patch",
+            Self::Build => "build",
+            Self::Downgrade => "downgrade",
+        };
+        write!(f, "{s}")
+    }
 }
 
 impl Formulae {
@@ -251,6 +301,79 @@ impl Formulae {
             latest: None,
         }
     }
+
+    /// Classifies the change between the installed and latest version.
+    fn version_diff(&self) -> VersionDiff {
+        let (Some(old), Some(new)) = (&self.installed, &self.latest) else {
+            return VersionDiff::Missing;
+        };
+
+        let (Some((a, a_rev)), Some((b, b_rev))) =
+            (parse_version_numbers(old), parse_version_numbers(new))
+        else {
+            return VersionDiff::Unparsable;
+        };
+
+        for i in 0..a.len().max(b.len()) {
+            let x = a.get(i).copied().unwrap_or(0);
+            let y = b.get(i).copied().unwrap_or(0);
+            if x != y {
+                if x > y {
+                    return VersionDiff::Downgrade;
+                }
+
+                return match i {
+                    0 => VersionDiff::Major,
+                    1 => VersionDiff::Minor,
+                    2 => VersionDiff::Patch,
+                    _ => VersionDiff::Build, // 4th+ segment: revision/build number
+                };
+            }
+        }
+
+        // Homebrew revision (`_N` suffix) only breaks ties between equal versions
+        if a_rev != b_rev {
+            return if a_rev > b_rev {
+                VersionDiff::Downgrade
+            } else {
+                VersionDiff::Build
+            };
+        }
+
+        // Numbers equal but raw strings differ (e.g. only the hash/build after the comma changed)
+        if version_build_id(old) == version_build_id(new) {
+            VersionDiff::NoChange
+        } else {
+            VersionDiff::Build
+        }
+    }
+}
+
+/// Returns the build identifier that follows the first comma in a version
+/// string, trimmed (e.g. `"3.23.12,2d29876d"` -> `Some("2d29876d")`).
+///
+/// Returns `None` when there is no comma (e.g. `"157.0"`).
+fn version_build_id(v: &str) -> Option<&str> {
+    v.split_once(',').map(|(_, m)| m.trim())
+}
+
+/// Parses the numeric part of a version string into its segments and its
+/// Homebrew revision (e.g. `"v9.4.1_2,44384"` -> `Some(([9, 4, 1], 2))`).
+///
+/// Ignores anything after the first comma, strips a leading `v`, splits a
+/// trailing `_N` revision (0 if absent), and splits the rest on `.` and `-`.
+/// Returns `None` if any segment is not a plain number (e.g. `"1.2.3-beta"`).
+fn parse_version_numbers(v: &str) -> Option<(Vec<u64>, u64)> {
+    let v = v.split(',').next()?.trim().trim_start_matches('v');
+    let (base, rev) = match v.split_once('_') {
+        Some((b, r)) => (b, r.parse().ok()?),
+        None => (v, 0),
+    };
+    let nums = base
+        .split(['.', '-'])
+        .map(|p| p.parse().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    Some((nums, rev))
 }
 
 fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
@@ -356,4 +479,33 @@ fn test_process_via_workers() {
     assert!(vals.len() == result.len());
 
     assert!(result.iter().map(|f| &f.name).eq(vals.iter()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diff(a: &str, b: &str) -> VersionDiff {
+        Formulae {
+            name: "test".into(),
+            installed: Some(a.into()),
+            latest: Some(b.into()),
+        }
+        .version_diff()
+    }
+
+    #[test]
+    fn classifies() {
+        assert_eq!(diff("157.0", "157.0.1"), VersionDiff::Patch);
+        assert_eq!(diff("8.1_1", "9.0.2"), VersionDiff::Major);
+        assert_eq!(diff("7.1.2-27", "7.1.2-32"), VersionDiff::Build);
+        assert_eq!(diff("1.0", "1.0.0"), VersionDiff::NoChange);
+        assert_eq!(diff("3.23.12,abc", "3.23.12,def"), VersionDiff::Build);
+        assert_eq!(diff("1.2.3-beta", "1.2.3"), VersionDiff::Unparsable);
+        assert_eq!(diff("1.2.3_1", "1.2.3"), VersionDiff::Downgrade);
+        assert_eq!(diff("1.2.3", "1.2.3_1"), VersionDiff::Build);
+        assert_eq!(diff("1.2.3_1", "1.2.3_1"), VersionDiff::NoChange);
+        assert_eq!(diff("1.2.3", "1.3.0"), VersionDiff::Minor);
+        assert_eq!(diff("2.0", "1.9"), VersionDiff::Downgrade);
+    }
 }
