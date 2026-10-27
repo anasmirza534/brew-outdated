@@ -197,7 +197,7 @@ fn print_help_stderr() {
 
 fn print_help(mut out: impl Write) {
     let _ = writeln!(out, "brew-outdate: list oudated package from brew");
-    let _ = writeln!(out, "version: 0.1.1");
+    let _ = writeln!(out, "version: {}", env!("CARGO_PKG_VERSION"));
     let _ = writeln!(out, "usage: brew-outdate [flags]");
     let _ = writeln!(out, "   flags:");
     let _ = writeln!(out, "      --cask");
@@ -209,16 +209,103 @@ fn max_width(formulaes: &[Formulae], get: impl Fn(&Formulae) -> &str) -> usize {
     formulaes.iter().map(|f| get(f).len()).max().unwrap_or(0)
 }
 
-fn print_table(title: &str, formulaes: Vec<Formulae>, only_installed: bool) {
+fn terminal_width() -> Option<usize> {
+    let env_cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse::<usize>().ok());
+
+    if let Some(w) = env_cols {
+        return Some(w);
+    }
+
+    let tty = std::fs::File::open("/dev/tty").ok()?;
+    let out = std::process::Command::new("stty")
+        .arg("size")
+        .stdin(tty)
+        .output()
+        .ok()?;
+
+    let tty_cols = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok();
+
+    if let Some(w) = tty_cols {
+        return Some(w);
+    }
+
+    None
+}
+
+/// Shorten long hex commit hashes (e.g. cask `1.2.3,<sha>`) to 7 chars like git.
+fn shorten_hashes(version: &str) -> String {
+    version
+        .split(',')
+        .map(|part| {
+            if part.len() > 7 && part.chars().all(|c| c.is_ascii_hexdigit()) {
+                &part[..7]
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+struct Widths {
+    name: usize,
+    installed: usize,
+    latest: usize,
+}
+
+impl Widths {
+    const PAD: usize = 2;
+    const INSTALLED_GAP: usize = 1;
+    const LATEST_GAP: usize = 3;
+    const DIFF_GAP: usize = 3;
+
+    fn new(fs: &[Formulae]) -> Self {
+        let col = |header: &str, get: fn(&Formulae) -> &str| {
+            max_width(fs, get).max(header.len()) + Self::PAD
+        };
+        Self {
+            name: col("Name", |f| f.name.as_str()),
+            installed: col("Installed", |f| f.installed.as_deref().unwrap_or("-")),
+            latest: col("Latest", |f| f.latest.as_deref().unwrap_or("-")),
+        }
+    }
+
+    /// Total printed row width; must match the layout used in `print_table`.
+    fn total(&self, only_installed: bool) -> usize {
+        let base = self.name + Self::INSTALLED_GAP + self.installed;
+        if only_installed {
+            base
+        } else {
+            base + Self::LATEST_GAP + self.latest + Self::DIFF_GAP + "Version Diff".len()
+        }
+    }
+}
+
+fn print_table(title: &str, mut formulaes: Vec<Formulae>, only_installed: bool) {
     if formulaes.is_empty() {
         return;
     }
 
-    let name_width = max_width(&formulaes, |f| f.name.as_str()).max("Name".len()) + 2;
-    let installed_width =
-        max_width(&formulaes, |f| f.installed.as_deref().unwrap_or("-")).max("Installed".len()) + 2;
-    let latest_width =
-        max_width(&formulaes, |f| f.latest.as_deref().unwrap_or("-")).max("Latest".len()) + 2;
+    if let Some(term) = terminal_width()
+        && Widths::new(&formulaes).total(only_installed) > term
+    {
+        for f in &mut formulaes {
+            f.installed = f.installed.as_deref().map(shorten_hashes);
+            f.latest = f.latest.as_deref().map(shorten_hashes);
+        }
+    }
+
+    let Widths {
+        name: name_width,
+        installed: installed_width,
+        latest: latest_width,
+    } = Widths::new(&formulaes);
 
     println!("{}", title);
     println!();
