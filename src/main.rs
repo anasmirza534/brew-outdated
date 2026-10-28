@@ -1,9 +1,8 @@
-use rand::Rng;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::vec;
 use std::{
     env,
     io::Write,
@@ -12,78 +11,40 @@ use std::{
 };
 
 fn main() -> ExitCode {
-    let mut help_flag = false;
-    let mut no_update_flag = false;
-    let mut cask_flag = false;
+    let Some(cmd_args) = parse_args() else {
+        return ExitCode::FAILURE;
+    };
 
-    let args: Vec<String> = env::args().skip(1).collect();
-
-    for arg in args.iter() {
-        if arg == "--help" {
-            help_flag = true;
-        } else if arg == "--no-update" {
-            no_update_flag = true;
-        } else if arg == "--cask" {
-            cask_flag = true;
-        } else {
-            eprintln!("unknown flag: {}", arg);
-            eprintln!();
-            print_help_stderr();
-
-            return ExitCode::FAILURE;
-        }
-    }
-
-    if help_flag {
-        print_help_stdout();
-
+    if cmd_args.help {
+        print_help(std::io::stdout());
         return ExitCode::SUCCESS;
     }
 
-    if !no_update_flag {
+    if !cmd_args.no_update {
         println!("running `brew update`");
 
-        let output = match Command::new("brew").arg("update").output() {
+        let _stdout = match run_brew(vec!["update"]) {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("`brew update` failed: {}", e);
                 return ExitCode::FAILURE;
             }
         };
-
-        if !output.status.success() {
-            eprintln!(
-                "`brew update` returns non zero exit code: {}",
-                output.status
-            );
-            return ExitCode::FAILURE;
-        }
     }
 
-    let mut brew_args = vec!["leaves"];
-    if cask_flag {
-        brew_args = vec!["list", "--cask"];
-    }
+    let brew_args = if cmd_args.cask {
+        vec!["list", "--cask"]
+    } else {
+        vec!["leaves"]
+    };
 
-    let cmd_name = format!("brew {}", brew_args.join(" "));
-
-    let output = match Command::new("brew").args(brew_args.clone()).output() {
+    let stdout = match run_brew(brew_args.clone()) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("`{}` failed: {}", cmd_name, e);
+            eprintln!("`{}` failed: {}", brew_args.join(" "), e);
             return ExitCode::FAILURE;
         }
     };
-
-    if !output.status.success() {
-        eprintln!(
-            "`{}` returns non zero exit code: {}",
-            cmd_name, output.status
-        );
-        return ExitCode::FAILURE;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut formulae_names: Vec<String> = stdout
         .lines()
@@ -96,7 +57,7 @@ fn main() -> ExitCode {
 
     let formulaes = process_via_workers(
         formulae_names,
-        move |f| get_formulae_versions(f.to_string(), cask_flag),
+        move |f| get_formulae_versions(f.to_string(), cmd_args.cask),
         None,
     );
 
@@ -121,13 +82,62 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+struct CmdArgs {
+    help: bool,
+    no_update: bool,
+    cask: bool,
+}
+
+fn parse_args() -> Option<CmdArgs> {
+    let mut cmd_args = CmdArgs {
+        help: false,
+        no_update: false,
+        cask: false,
+    };
+
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    for arg in args.iter() {
+        if arg == "--help" {
+            cmd_args.help = true;
+        } else if arg == "--no-update" {
+            cmd_args.no_update = true;
+        } else if arg == "--cask" {
+            cmd_args.cask = true;
+        } else {
+            eprintln!("unknown flag: {}", arg);
+            eprintln!();
+            print_help(std::io::stderr());
+
+            return None;
+        }
+    }
+
+    Some(cmd_args)
+}
+
+fn run_brew(args: Vec<&str>) -> Result<String, String> {
+    let output = match Command::new("brew").args(args).output() {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(e.to_string());
+        }
+    };
+
+    if !output.status.success() {
+        return Err(format!("returns non zero exit code: {}", output.status));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    Ok(stdout)
+}
+
 fn process_via_workers(
     data: Vec<String>,
     get: impl Fn(&String) -> Formulae + Send + Sync + 'static,
     worker_num: Option<usize>,
 ) -> Vec<Formulae> {
-    let debug = false;
-
     let worker_count = worker_num.unwrap_or_else(|| {
         thread::available_parallelism()
             .map(|n| n.get())
@@ -142,12 +152,7 @@ fn process_via_workers(
     let indexed: VecDeque<(usize, String)> = data.into_iter().enumerate().collect();
     let queue = Arc::new(Mutex::new(indexed));
 
-    for wc in 1..=worker_count {
-        let worker_name = format!("{:0>2}", wc.to_string());
-        if debug {
-            println!("creating worker: {}", worker_name);
-        }
-
+    for _wc in 1..=worker_count {
         let get = Arc::clone(&get);
         let tx1 = tx.clone();
         let queue1 = Arc::clone(&queue);
@@ -162,10 +167,6 @@ fn process_via_workers(
 
                 match val {
                     Some((idx, val)) => {
-                        if debug {
-                            println!("processing worker name: {} -> val {}", worker_name, val);
-                        }
-
                         let formulae = get(&val);
                         tx1.send((idx, formulae)).unwrap();
                     }
@@ -185,14 +186,6 @@ fn process_via_workers(
     result.sort_by_key(|(idx, _)| *idx);
 
     result.into_iter().map(|(_, f)| f).collect()
-}
-
-fn print_help_stdout() {
-    print_help(std::io::stdout());
-}
-
-fn print_help_stderr() {
-    print_help(std::io::stderr());
 }
 
 fn print_help(mut out: impl Write) {
@@ -470,7 +463,7 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
     }
     brew_args.push(&formulae);
 
-    let output = match Command::new("brew").args(brew_args).output() {
+    let stdout = match run_brew(brew_args) {
         Ok(o) => o,
         Err(e) => {
             eprintln!(
@@ -481,19 +474,6 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
             return Formulae::unknown(formulae);
         }
     };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        eprintln!(
-            "`brew info` return non zero exit code: {} and error: {}",
-            output.status, stderr
-        );
-
-        return Formulae::unknown(formulae);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
 
     match serde_json::from_str::<Value>(&stdout) {
         Ok(json) => {
@@ -525,52 +505,53 @@ fn get_formulae_versions(formulae: String, is_cask: bool) -> Formulae {
     }
 }
 
-#[allow(dead_code)]
-fn get_formulae_mock(formulae: String) -> Formulae {
-    let wait_mili: u32 = rand::thread_rng().gen_range(200..1500);
-
-    println!("Processing: {}\t\twait: {:<5} mili", formulae, wait_mili);
-
-    thread::sleep(Duration::from_millis(wait_mili as u64));
-
-    let prob = rand::random::<f64>();
-    if prob <= 0.1 {
-        return Formulae {
-            name: formulae,
-            installed: None,
-            latest: None,
-        };
-    }
-
-    if (0.1..=0.75).contains(&prob) {
-        return Formulae {
-            name: formulae,
-            installed: Some("1.0.3".to_string()),
-            latest: Some("1.0.3".to_string()),
-        };
-    }
-
-    Formulae {
-        name: formulae,
-        installed: Some("2.5.3".to_string()),
-        latest: Some("2.8.11".to_string()),
-    }
-}
-
-#[test]
-fn test_process_via_workers() {
-    let vals: Vec<String> = (1..=18).map(|n| n.to_string()).collect();
-
-    let result = process_via_workers(vals.clone(), |f| get_formulae_mock(f.to_string()), None);
-
-    assert!(vals.len() == result.len());
-
-    assert!(result.iter().map(|f| &f.name).eq(vals.iter()));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
+    use std::time::Duration;
+
+    fn get_formulae_mock(formulae: String) -> Formulae {
+        let wait_mili: u32 = rand::thread_rng().gen_range(200..1500);
+
+        println!("Processing: {}\t\twait: {:<5} mili", formulae, wait_mili);
+
+        thread::sleep(Duration::from_millis(wait_mili as u64));
+
+        let prob = rand::random::<f64>();
+        if prob <= 0.1 {
+            return Formulae {
+                name: formulae,
+                installed: None,
+                latest: None,
+            };
+        }
+
+        if (0.1..=0.75).contains(&prob) {
+            return Formulae {
+                name: formulae,
+                installed: Some("1.0.3".to_string()),
+                latest: Some("1.0.3".to_string()),
+            };
+        }
+
+        Formulae {
+            name: formulae,
+            installed: Some("2.5.3".to_string()),
+            latest: Some("2.8.11".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_process_via_workers() {
+        let vals: Vec<String> = (1..=18).map(|n| n.to_string()).collect();
+
+        let result = process_via_workers(vals.clone(), |f| get_formulae_mock(f.to_string()), None);
+
+        assert!(vals.len() == result.len());
+
+        assert!(result.iter().map(|f| &f.name).eq(vals.iter()));
+    }
 
     fn diff(a: &str, b: &str) -> VersionDiff {
         Formulae {
